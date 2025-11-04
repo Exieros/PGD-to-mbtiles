@@ -5,3 +5,4 @@ ru.maps.pgd2mbtiles
 __pycache__
 html
 .gitattributes
+.gitignore

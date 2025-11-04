@@ -44,4 +44,3 @@ python pgd_batch.py --pgd-path path/to/folder \
 - Дополнительные аргументы после известных опций (например, `--save-ms`) будут переданы непосредственно `pgd_assemble.py`.
 
 **@soreixe**
-**CC0**
