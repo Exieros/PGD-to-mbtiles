@@ -12,7 +12,7 @@ python -m pip install -r requirements.txt
 
 ## Использование
 ```sh
-python pgd_assemble.py --pgd path/to/file.pgd \
+python pgd_assemble.py [--pgd path/to/file.pgd] \
 	[--out-name output_name] \
 	[--format {webp|png}] \
 	[--save-mosaic] \
@@ -21,26 +21,13 @@ python pgd_assemble.py --pgd path/to/file.pgd \
 	[--zoom-pad N] \
 	[--no-dedup]
 ```
-- `--pgd` — входной PGD-файл (обязательный параметр).
+- `--pgd` — путь к PGD-файлу; если флаг не указан, откроется диалог выбора (можно выбрать несколько файлов, обработка выполнится для каждого).
 - `--out-name` — базовое имя результатов (мозаика, mbtiles, `.ms`).
 - `--format` — формат изображений (`webp` или `png`).
 - `--save-mosaic` — сохранить промежуточную мозаику.
 - `--save-bounds` — записать `*_bounds.json` с охватом карты.
-- `--save-ms` — создать профиль Guru Maps (`*.ms`). GuruMaps игнорирует type=ovarlay в метаданных.
+- `--save-ms` — создать профиль Guru Maps (`*.ms`). GuruMaps игнорирует type=overlay в метаданных.
 - `--zoom-pad` — отступ вниз от автоматически вычисленного максимального зума (нижние уровни строятся из тайлов максимального масштаба — без геометрического дрейфа).
 - `--no-dedup` — отключить дедупликацию одинаковых тайлов.
-
-```sh
-python pgd_batch.py --pgd-path path/to/folder \
-	[--format {webp|png}] \
-	[--zoom-pad N] \
-	[--stop-on-error] \
-	[additional pgd_assemble options ...]
-```
-- `--pgd-path` — каталог для рекурсивного поиска `.pgd` (обязательный параметр).
-- `--format` — формат, передаваемый каждому запуску `pgd_assemble.py`.
-- `--zoom-pad` — значение по умолчанию для всех файлов.
-- `--stop-on-error` — остановить пакет при первой ошибке.
-- Дополнительные аргументы после известных опций (например, `--save-ms`) будут переданы непосредственно `pgd_assemble.py`.
 
 **@soreixe**

@@ -3,12 +3,14 @@ import io
 import json
 import os
 import struct
-import argparse
 import math
 import html
 import numpy as np
 import cv2
-from typing import Tuple, Generator
+import click
+from typing import Tuple, Generator, Optional, Sequence
+from tkinter import Tk
+from tkinter import filedialog
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None  # Отключить предупреждение DecompressionBombWarning
 from pgd_geowarp_mbtiles import export_geowarp_mbtiles, build_lower_zoom_pyramid
@@ -647,34 +649,67 @@ def apply_affine_to_points(src_points, affine_coeffs):
         dst_points.append((dst_x, dst_y))
     return dst_points
 
+def save_bounds(output_base, bounds):
+    bounds_path = f"{output_base}_bounds.json"
+    bounds_dir = os.path.dirname(bounds_path)
+    if bounds_dir and not os.path.isdir(bounds_dir):
+        os.makedirs(bounds_dir, exist_ok=True)
+    with open(bounds_path, 'w', encoding='utf-8') as bounds_file:
+        json.dump(bounds, bounds_file, ensure_ascii=False, indent=2)
+    print(f'[--save-bounds] Границы сохранены в {bounds_path}')
+
+def save_ms(output_base, metadata_name, min_zoom, max_zoom):
+    ms_path = f"{output_base}.ms"
+    ms_dir = os.path.dirname(ms_path)
+    if ms_dir and not os.path.isdir(ms_dir):
+        os.makedirs(ms_dir, exist_ok=True)
+    ms_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<customMapSource overlay="true" overzoom="true">\n'
+        f'    <name>{html.escape(metadata_name)}</name>\n'
+        f'    <minZoom>{min_zoom}</minZoom>\n'
+        f'    <maxZoom>{max_zoom}</maxZoom>\n'
+        '</customMapSource>\n'
+    )
+    with open(ms_path, 'w', encoding='utf-8') as ms_file:
+        ms_file.write(ms_xml)
+    print(f'[--save-ms] MapSource сохранён в {ms_path}')
+
+
+def choose_pgd_files() -> Sequence[str]:
+    """Открывает диалог выбора PGD-файлов, возвращает кортеж путей."""
+    root = Tk()
+    root.withdraw()
+    try:
+        paths = filedialog.askopenfilenames(
+            title='Выберите PGD-файл(ы)',
+            filetypes=[('PGD files', '*.pgd'), ('All files', '*.*')],
+        )
+    finally:
+        root.destroy()
+    return paths
+
 MBTILES_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);
 CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS tile_index on tiles (zoom_level, tile_column, tile_row);
 '''
 
-parser = argparse.ArgumentParser(
-        description='Собирает мозаику из PGD-файла, поддерживает crop по outline, экспорт outline, сохранение тайлов, экспорт в MBTiles.'
-    )
-parser.add_argument('--pgd', default=None,
-    help='Путь к PGD-файлу')
-parser.add_argument('--out-name', default=None,
-    help='Базовое имя выходных файлов (без расширения). По умолчанию используется имя PGD-файла.')
-parser.add_argument('--format', default='webp', choices=['webp', 'png'],
-    help='Формат итогового изображения: webp или png. По умолчанию webp.')
-parser.add_argument('--save-mosaic', action='store_true',
-    help='Сохранять промежуточную мозаику на диск')
-parser.add_argument('--save-bounds', action='store_true',
-    help='Сохранить bounds в json(например для использования в leafletjs)')
-parser.add_argument('--no-dedup', action='store_true', help='Disable deduplication of identical tiles')
-parser.add_argument('--zoom-pad', type=int, default=0, help='Сколько дополнительных уровней вниз от автоматически вычисленного зума добавить. Тайлы для уровней ниже рассчитываются от самого детального в PGD.')
-parser.add_argument('--save-ms', action='store_true', help='Сохранить MapSource (.ms) файл для Guru Maps(иначе mbtiles исключительно как источник карт открывается, а не overlay. GuruMaps игнорирует type=overlay mbtiles spec в metadata??)')
-args = parser.parse_args()
-
-def main():
+def run_conversion(
+    pgd_path: str,
+    out_name: Optional[str],
+    image_format: str,
+    save_mosaic: bool,
+    save_bounds_flag: bool,
+    save_ms_flag: bool,
+    zoom_pad: int,
+    no_dedup: bool,
+) -> None:
     base = os.path.dirname(__file__)
-    pgd_path = args.pgd
-    raw_out_name = args.out_name or os.path.splitext(os.path.basename(pgd_path))[0]
+    image_format = image_format.lower()
+    if image_format not in ('webp', 'png'):
+        raise ValueError('Поддерживаются только форматы webp или png')
+    raw_out_name = out_name or os.path.splitext(os.path.basename(pgd_path))[0]
     out_stem = os.path.splitext(raw_out_name)[0]
     if os.path.isabs(out_stem):
         output_base = os.path.normpath(out_stem)
@@ -700,26 +735,27 @@ def main():
         mosaic, tile_count = assemble_image(fv, level, TILE_SIZE)
         print(f'Размер мозайки: {mosaic.size[0]}x{mosaic.size[1]}')
 
-        if args.save_mosaic:
-            output_format = args.format.upper()
-            mosaic_out_path = f"{output_base}.{args.format.lower()}"
+        # --- Сохраняем мозаику на диск при соответствующем аргументе ---
+        if save_mosaic:
+            output_format = image_format.upper()
+            mosaic_out_path = f"{output_base}.{image_format}"
             mosaic_out_dir = os.path.dirname(mosaic_out_path)
             if mosaic_out_dir and not os.path.isdir(mosaic_out_dir):
                 os.makedirs(mosaic_out_dir, exist_ok=True)
             mosaic.save(mosaic_out_path, format=output_format)
             print(f'[--save-mosaic] Мозаика сохранена в {mosaic_out_path}')
 
+        # --- Применяем афинное преобразование, вычисляем матрицу ---
         _, _, srcPoints = get_canvas_size_bounds(mosaic)
         dstPoints = apply_affine_to_points(srcPoints, affin_coeffs[:9])
-
         src_np = np.array(srcPoints, dtype=np.float32)
         dst_np = np.array(dstPoints, dtype=np.float32)
         M = cv2.getPerspectiveTransform(src_np, dst_np)
-
         width = int(np.ceil(np.max(dst_np[:, 0]) - np.min(dst_np[:, 0])))
         height = int(np.ceil(np.max(dst_np[:, 1]) - np.min(dst_np[:, 1])))
         offset_x = np.min(dst_np[:, 0])
         offset_y = np.min(dst_np[:, 1])
+        # --- Матрица сдвига холста в 0,0 после преобразования ---
         T = np.array([[1, 0, -offset_x], [0, 1, -offset_y], [0, 0, 1]], dtype=np.float32)
         M_shifted = (T @ M).astype(np.float64)
 
@@ -731,6 +767,7 @@ def main():
         del mosaic
         gc.collect()
 
+        # --- Так как матрица дает px->mercator скейлим холст к исходной ширине ---
         if width != original_width and original_width > 0:
             scale_x = original_width / width
             scale_matrix = np.array([
@@ -773,7 +810,7 @@ def main():
         if zoom < 0:
             raise RuntimeError('Не удалось определить уровень зума для MBTiles')
 
-        zoom_pad = max(0, args.zoom_pad)
+        zoom_pad = max(0, zoom_pad)
         max_zoom = max(0, zoom)
         min_zoom = max(0, max_zoom - zoom_pad)
 
@@ -782,37 +819,16 @@ def main():
         center_zoom = (min_zoom + max_zoom) // 2
         center = "%.6f,%.6f,%d" % (center_lon, center_lat, center_zoom)
 
-        if args.save_bounds:
-            bounds_path = f"{output_base}_bounds.json"
-            bounds_dir = os.path.dirname(bounds_path)
-            if bounds_dir and not os.path.isdir(bounds_dir):
-                os.makedirs(bounds_dir, exist_ok=True)
-            with open(bounds_path, 'w', encoding='utf-8') as bounds_file:
-                json.dump(bounds, bounds_file, ensure_ascii=False, indent=2)
-            print(f'[--save-bounds] Границы сохранены в {bounds_path}')
+        if save_bounds_flag:
+            save_bounds(output_base, bounds)
 
-        if args.save_ms:
-            ms_path = f"{output_base}.ms"
-            ms_dir = os.path.dirname(ms_path)
-            if ms_dir and not os.path.isdir(ms_dir):
-                os.makedirs(ms_dir, exist_ok=True)
-            ms_name = html.escape(metadata_name)
-            ms_xml = (
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                '<customMapSource overlay="true" overzoom="true">\n'
-                f'    <name>{ms_name}</name>\n'
-                f'    <minZoom>{min_zoom}</minZoom>\n'
-                f'    <maxZoom>{max_zoom}</maxZoom>\n'
-                '</customMapSource>\n'
-            )
-            with open(ms_path, 'w', encoding='utf-8') as ms_file:
-                ms_file.write(ms_xml)
-            print(f'[--save-ms] MapSource сохранён в {ms_path}')
+        if save_ms_flag:
+            save_ms(output_base, metadata_name, min_zoom, max_zoom)
 
         mbtiles_tile_size = 256
         mbtiles_metadata = {
             'name': metadata_name,
-            'format': args.format,
+            'format': image_format,
             'type': 'overlay',
             'version': '1.0',
             'description': '@soreixe',
@@ -836,8 +852,8 @@ def main():
             mbtiles_path,
             tile_size=mbtiles_tile_size,
             metadata=mbtiles_metadata,
-            deduplicate=not args.no_dedup,
-            image_format=args.format,
+            deduplicate=not no_dedup,
+            image_format=image_format,
             min_zoom=render_min_zoom,
             max_zoom=max_zoom,
             projective_source={
@@ -852,9 +868,9 @@ def main():
             mbtiles_path,
             min_zoom=min_zoom,
             max_zoom=max_zoom,
-            image_format=args.format,
+            image_format=image_format,
             tile_size=mbtiles_tile_size,
-            deduplicate=not args.no_dedup,
+            deduplicate=not no_dedup,
         )
 
         del img_np
@@ -862,6 +878,78 @@ def main():
 
     finally:
         fv.close()
+
+
+@click.command()
+@click.option(
+    '--pgd',
+    'pgd_path',
+    default=None,
+    type=str,
+    help='Путь к входному PGD-файлу. Если не указан, откроется диалог выбора.',
+)
+@click.option(
+    '--out-name',
+    default=None,
+    type=str,
+    help='Базовое имя выходных файлов (без расширения). По умолчанию используется имя PGD-файла.',
+)
+@click.option(
+    '--format',
+    'image_format',
+    default='webp',
+    type=click.Choice(['webp', 'png'], case_sensitive=False),
+    show_default=True,
+    help='Формат итоговых изображений (webp или png).',
+)
+@click.option('--save-mosaic', is_flag=True, help='Сохранять промежуточную мозаику на диск.')
+@click.option('--save-bounds', 'save_bounds_flag', is_flag=True, help='Сохранить bounds в JSON (например, для Leaflet).')
+@click.option('--save-ms', 'save_ms_flag', is_flag=True, help='Создать MapSource (*.ms) для Guru Maps.')
+@click.option(
+    '--zoom-pad',
+    default=0,
+    show_default=True,
+    type=int,
+    help='Количество уровней вниз от автоматически вычисленного зума.',
+)
+@click.option('--no-dedup', is_flag=True, help='Отключить дедупликацию одинаковых тайлов.')
+
+def main(
+    pgd_path: Optional[str],
+    out_name: Optional[str],
+    image_format: str,
+    save_mosaic: bool,
+    save_bounds_flag: bool,
+    save_ms_flag: bool,
+    zoom_pad: int,
+    no_dedup: bool,
+) -> None:
+    """CLI-обёртка для конвертации PGD в MBTiles."""
+
+    targets: Sequence[str]
+    if pgd_path:
+        targets = (pgd_path,)
+    else:
+        selected = choose_pgd_files()
+        if not selected:
+            print('PGD-файлы не выбраны. Выход.')
+            return
+        targets = selected
+
+    for idx, path in enumerate(targets, start=1):
+        if len(targets) > 1:
+            print(f"[{idx}/{len(targets)}] {path}")
+        run_conversion(
+            pgd_path=path,
+            out_name=out_name,
+            image_format=image_format,
+            save_mosaic=save_mosaic,
+            save_bounds_flag=save_bounds_flag,
+            save_ms_flag=save_ms_flag,
+            zoom_pad=zoom_pad,
+            no_dedup=no_dedup,
+        )
+
 
 if __name__ == '__main__':
     main()
