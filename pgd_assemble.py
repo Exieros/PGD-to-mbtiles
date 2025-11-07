@@ -8,6 +8,7 @@ import html
 import numpy as np
 import cv2
 import click
+from dataclasses import dataclass
 from typing import Tuple, Generator, Optional, Sequence
 from tkinter import Tk
 from tkinter import filedialog
@@ -22,6 +23,159 @@ MAGIC_ENTRIES_LIST/TABLE — сигнатуры списков и таблиц, 
 """
 MAGIC_FILE = 0x5047443A
 MAGIC_NODE = 87381
+
+@dataclass
+class ProjectiveContext:
+    img_np: np.ndarray
+    dest_size: Tuple[int, int]
+    matrix_inv: np.ndarray
+    corners: Sequence[Tuple[float, float]]
+    width: int
+    height: int
+
+@dataclass
+class ZoomMetadata:
+    bounds: Tuple[float, float, float, float]
+    bounds_str: str
+    center: str
+    min_zoom: int
+    max_zoom: int
+    zoom: int
+    render_min_zoom: int
+    center_lat: float
+    center_lon: float
+
+
+def resolve_output_paths(pgd_path: str) -> Tuple[str, str, str]:
+    pgd_abs_path = os.path.abspath(pgd_path)
+    pgd_dir = os.path.dirname(pgd_abs_path)
+    pgd_basename = os.path.splitext(os.path.basename(pgd_abs_path))[0]
+    out_stem = pgd_basename
+    if os.path.isabs(out_stem):
+        output_base = os.path.normpath(out_stem)
+    else:
+        output_base = os.path.normpath(os.path.join(pgd_dir, out_stem))
+    metadata_name = os.path.basename(out_stem) or pgd_basename
+    return pgd_abs_path, output_base, metadata_name
+
+
+def load_level_metadata(fv: 'FileView') -> Tuple['Node', dict, Sequence[float], int]:
+    root = load_root_node(fv)
+    if root is None:
+        raise RuntimeError('Failed to load root node from PGD')
+    level = find_highest_detail_level_node(fv, root)
+    if level is None:
+        raise RuntimeError('Failed to locate any level node')
+    meta = read_node_metadata(fv, level)
+    affin_coeffs = get_affin_coeffs(fv)
+    tile_size = meta['PPTX']
+    return level, meta, affin_coeffs, tile_size
+
+
+def build_projective_context(mosaic: Image.Image, affin_coeffs: Sequence[float]) -> ProjectiveContext:
+    _, _, src_points = get_canvas_size_bounds(mosaic)
+    dst_points = apply_affine_to_points(src_points, affin_coeffs[:9])
+    src_np = np.array(src_points, dtype=np.float32)
+    dst_np = np.array(dst_points, dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src_np, dst_np)
+    width = int(np.ceil(np.max(dst_np[:, 0]) - np.min(dst_np[:, 0])))
+    height = int(np.ceil(np.max(dst_np[:, 1]) - np.min(dst_np[:, 1])))
+    offset_x = np.min(dst_np[:, 0])
+    offset_y = np.min(dst_np[:, 1])
+    shift_matrix = np.array([[1, 0, -offset_x], [0, 1, -offset_y], [0, 0, 1]], dtype=np.float32)
+    M_shifted = (shift_matrix @ M).astype(np.float64)
+
+    original_width = mosaic.width
+    img_np = np.asarray(mosaic)
+    if not img_np.flags['C_CONTIGUOUS']:
+        img_np = np.ascontiguousarray(img_np)
+    mosaic.close()
+
+    if width != original_width and original_width > 0:
+        scale_x = original_width / width
+        scale_matrix = np.array([
+            [scale_x, 0.0, 0.0],
+            [0.0, scale_x, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        M_shifted = scale_matrix @ M_shifted
+        width = original_width
+        height = max(1, int(round(height * scale_x)))
+
+    dest_width = int(width)
+    dest_height = int(height)
+    dest_size = (dest_width, dest_height)
+    matrix_inv = np.linalg.inv(M_shifted)
+
+    corners = [mercator_to_lonlat(x, y) for x, y in dst_points]
+    corners = [(lat, -lon) for lat, lon in corners]
+
+    gc.collect()
+    return ProjectiveContext(
+        img_np=img_np,
+        dest_size=dest_size,
+        matrix_inv=matrix_inv,
+        corners=corners,
+        width=dest_width,
+        height=dest_height,
+    )
+
+
+def compute_zoom_metadata(
+    corners: Sequence[Tuple[float, float]],
+    width: int,
+    height: int,
+    tile_size: int,
+    zoom_pad: int,
+    max_zoom_pad: int,
+) -> ZoomMetadata:
+    lons = [pt[0] for pt in corners]
+    lats = [pt[1] for pt in corners]
+    bounds = (min(lons), min(lats), max(lons), max(lats))
+    bounds_str = "%.8f,%.8f,%.8f,%.8f" % bounds
+
+    lon_coverage = abs(max(lons) - min(lons))
+    zoom = -1
+    if lon_coverage > 0:
+        px_per_deg = width / lon_coverage
+        for z in range(34):
+            std_px_per_deg = (2 ** z) * 256.0 / 360.0
+            if std_px_per_deg > px_per_deg:
+                zoom = z
+                break
+        if zoom == -1:
+            zoom = int(round(math.log2(max(width, height) / tile_size)))
+    else:
+        zoom = int(round(math.log2(max(width, height) / tile_size)))
+
+    if zoom < 0:
+        raise RuntimeError('Не удалось определить уровень зума для MBTiles')
+
+    zoom = max(0, zoom + max_zoom_pad)
+
+    zoom_pad = max(0, zoom_pad)
+    max_zoom = max(0, zoom)
+    min_zoom = max(0, max_zoom - zoom_pad)
+
+    center_lat = (min(lats) + max(lats)) / 2.0
+    center_lon = (min(lons) + max(lons)) / 2.0
+    center_zoom = (min_zoom + max_zoom) // 2
+    center = "%.6f,%.6f,%d" % (center_lon, center_lat, center_zoom)
+
+    render_min_zoom = max_zoom if min_zoom < max_zoom else min_zoom
+
+    return ZoomMetadata(
+        bounds=bounds,
+        bounds_str=bounds_str,
+        center=center,
+        min_zoom=min_zoom,
+        max_zoom=max_zoom,
+        zoom=zoom,
+        render_min_zoom=render_min_zoom,
+        center_lat=center_lat,
+        center_lon=center_lon,
+    )
+
 MAGIC_ENTRIES_LIST = 152917
 MAGIC_ENTRIES_TABLE = 283989
 MAGIC_DATA_MAIN = 1070421
@@ -49,6 +203,13 @@ class FileView:
         self.path = path
         self.f = open(path, 'rb')
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def close(self):
         try:
             self.f.close()
@@ -64,9 +225,6 @@ class FileView:
 
     def u64_at(self, pos):
         return be_u64(self.read_at(pos, 8))
-        import gc
-
-
 
 class NodeListPage:
     """
@@ -658,17 +816,22 @@ def save_bounds(output_base, bounds):
         json.dump(bounds, bounds_file, ensure_ascii=False, indent=2)
     print(f'[--save-bounds] Границы сохранены в {bounds_path}')
 
-def save_ms(output_base, metadata_name, min_zoom, max_zoom):
+def save_ms(output_base, metadata_name, min_zoom, max_zoom, opacity: Optional[float] = None):
     ms_path = f"{output_base}.ms"
     ms_dir = os.path.dirname(ms_path)
     if ms_dir and not os.path.isdir(ms_dir):
         os.makedirs(ms_dir, exist_ok=True)
+    opacity_line = ''
+    if opacity is not None:
+        clamped = max(0.0, min(1.0, float(opacity)))
+        opacity_line = f'    <opacity>{clamped:.3f}</opacity>\n'
     ms_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<customMapSource overlay="true" overzoom="true">\n'
         f'    <name>{html.escape(metadata_name)}</name>\n'
         f'    <minZoom>{min_zoom}</minZoom>\n'
         f'    <maxZoom>{max_zoom}</maxZoom>\n'
+        f'{opacity_line}'
         '</customMapSource>\n'
     )
     with open(ms_path, 'w', encoding='utf-8') as ms_file:
@@ -697,45 +860,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS tile_index on tiles (zoom_level, tile_column, 
 
 def run_conversion(
     pgd_path: str,
-    out_name: Optional[str],
     image_format: str,
     save_mosaic: bool,
     save_bounds_flag: bool,
     save_ms_flag: bool,
+    ms_opacity: Optional[float],
     zoom_pad: int,
+    max_zoom_pad: int,
     no_dedup: bool,
 ) -> None:
-    base = os.path.dirname(__file__)
+    pgd_abs_path, output_base, metadata_name = resolve_output_paths(pgd_path)
     image_format = image_format.lower()
     if image_format not in ('webp', 'png'):
         raise ValueError('Поддерживаются только форматы webp или png')
-    raw_out_name = out_name or os.path.splitext(os.path.basename(pgd_path))[0]
-    out_stem = os.path.splitext(raw_out_name)[0]
-    if os.path.isabs(out_stem):
-        output_base = os.path.normpath(out_stem)
-    else:
-        output_base = os.path.normpath(os.path.join(base, out_stem))
-    metadata_name = os.path.basename(out_stem) or os.path.splitext(os.path.basename(pgd_path))[0]
-    fv = FileView(pgd_path)
+    with FileView(pgd_abs_path) as fv:
+        level, _, affin_coeffs, tile_size = load_level_metadata(fv)
 
-    try:
-        root = load_root_node(fv)
-        if root is None:
-            raise RuntimeError('Failed to load root node from PGD')
-        level = find_highest_detail_level_node(fv, root)
-        if level is None:
-            raise RuntimeError('Failed to locate any level node')
-
-        # --- Необходимые метаданные PGD для работы ---
-        meta = read_node_metadata(fv, level)
-        affin_coeffs = get_affin_coeffs(fv)
-        TILE_SIZE = meta['PPTX']
-
-        # --- Собираем мозаику ---
-        mosaic, tile_count = assemble_image(fv, level, TILE_SIZE)
+        mosaic, _tile_count = assemble_image(fv, level, tile_size)
         print(f'Размер мозайки: {mosaic.size[0]}x{mosaic.size[1]}')
 
-        # --- Сохраняем мозаику на диск при соответствующем аргументе ---
         if save_mosaic:
             output_format = image_format.upper()
             mosaic_out_path = f"{output_base}.{image_format}"
@@ -745,139 +888,73 @@ def run_conversion(
             mosaic.save(mosaic_out_path, format=output_format)
             print(f'[--save-mosaic] Мозаика сохранена в {mosaic_out_path}')
 
-        # --- Применяем афинное преобразование, вычисляем матрицу ---
-        _, _, srcPoints = get_canvas_size_bounds(mosaic)
-        dstPoints = apply_affine_to_points(srcPoints, affin_coeffs[:9])
-        src_np = np.array(srcPoints, dtype=np.float32)
-        dst_np = np.array(dstPoints, dtype=np.float32)
-        M = cv2.getPerspectiveTransform(src_np, dst_np)
-        width = int(np.ceil(np.max(dst_np[:, 0]) - np.min(dst_np[:, 0])))
-        height = int(np.ceil(np.max(dst_np[:, 1]) - np.min(dst_np[:, 1])))
-        offset_x = np.min(dst_np[:, 0])
-        offset_y = np.min(dst_np[:, 1])
-        # --- Матрица сдвига холста в 0,0 после преобразования ---
-        T = np.array([[1, 0, -offset_x], [0, 1, -offset_y], [0, 0, 1]], dtype=np.float32)
-        M_shifted = (T @ M).astype(np.float64)
-
-        original_width = mosaic.width
-        img_np = np.asarray(mosaic)
-        if not img_np.flags['C_CONTIGUOUS']:
-            img_np = np.ascontiguousarray(img_np)
-        mosaic.close()
+        projective_ctx = build_projective_context(mosaic, affin_coeffs)
         del mosaic
-        gc.collect()
 
-        # --- Так как матрица дает px->mercator скейлим холст к исходной ширине ---
-        if width != original_width and original_width > 0:
-            scale_x = original_width / width
-            scale_matrix = np.array([
-                [scale_x, 0.0, 0.0],
-                [0.0, scale_x, 0.0],
-                [0.0, 0.0, 1.0],
-            ], dtype=np.float64)
-            M_shifted = scale_matrix @ M_shifted
-            width = original_width
-            height = max(1, int(round(height * scale_x)))
+    zoom_meta = compute_zoom_metadata(
+        corners=projective_ctx.corners,
+        width=projective_ctx.width,
+        height=projective_ctx.height,
+        tile_size=tile_size,
+        zoom_pad=zoom_pad,
+        max_zoom_pad=max_zoom_pad,
+    )
 
-        dest_width = int(width)
-        dest_height = int(height)
-        dest_size = (dest_width, dest_height)
-        width = dest_width
-        height = dest_height
-        M_inv = np.linalg.inv(M_shifted)
+    if save_bounds_flag:
+        save_bounds(output_base, zoom_meta.bounds)
 
-        corners = [mercator_to_lonlat(x, y) for x, y in dstPoints]
-        corners = [(lat, -lon) for lat, lon in corners]
-        lons = [pt[0] for pt in corners]
-        lats = [pt[1] for pt in corners]
-        bounds = (min(lons), min(lats), max(lons), max(lats))
-        bounds_str = "%.8f,%.8f,%.8f,%.8f" % bounds
+    if save_ms_flag:
+        save_ms(output_base, metadata_name, zoom_meta.min_zoom, zoom_meta.max_zoom, ms_opacity)
 
-        lon_coverage = abs(max(lons) - min(lons))
-        zoom = -1
-        if lon_coverage > 0:
-            px_per_deg = width / lon_coverage
-            for z in range(34):
-                std_px_per_deg = (2 ** z) * 256.0 / 360.0
-                if std_px_per_deg > px_per_deg:
-                    zoom = z
-                    break
-            if zoom == -1:
-                zoom = int(round(math.log2(max(width, height) / TILE_SIZE)))
-        else:
-            zoom = int(round(math.log2(max(width, height) / TILE_SIZE)))
+    mbtiles_tile_size = 256
+    mbtiles_metadata = {
+        'name': metadata_name,
+        'format': image_format,
+        'type': 'overlay',
+        'version': '1.0',
+        'description': '@soreixe',
+        'minzoom': str(zoom_meta.min_zoom),
+        'maxzoom': str(zoom_meta.max_zoom),
+        'bounds': zoom_meta.bounds_str,
+        'center': zoom_meta.center,
+    }
 
-        if zoom < 0:
-            raise RuntimeError('Не удалось определить уровень зума для MBTiles')
+    mbtiles_path = f"{output_base}.mbtiles"
+    mbtiles_dir = os.path.dirname(mbtiles_path)
+    if mbtiles_dir and not os.path.isdir(mbtiles_dir):
+        os.makedirs(mbtiles_dir, exist_ok=True)
+    print(f"Экспорт MBTiles в {mbtiles_path} ...")
 
-        zoom_pad = max(0, zoom_pad)
-        max_zoom = max(0, zoom)
-        min_zoom = max(0, max_zoom - zoom_pad)
+    export_geowarp_mbtiles(
+        None,
+        zoom_meta.bounds,
+        zoom_meta.zoom,
+        mbtiles_path,
+        tile_size=mbtiles_tile_size,
+        metadata=mbtiles_metadata,
+        deduplicate=not no_dedup,
+        image_format=image_format,
+        min_zoom=zoom_meta.render_min_zoom,
+        max_zoom=zoom_meta.max_zoom,
+        projective_source={
+            'src_array': projective_ctx.img_np,
+            'matrix_inv': projective_ctx.matrix_inv,
+            'dest_size': projective_ctx.dest_size,
+            'border_value': (0, 0, 0, 0),
+        },
+    )
 
-        center_lat = (min(lats) + max(lats)) / 2.0
-        center_lon = (min(lons) + max(lons)) / 2.0
-        center_zoom = (min_zoom + max_zoom) // 2
-        center = "%.6f,%.6f,%d" % (center_lon, center_lat, center_zoom)
+    build_lower_zoom_pyramid(
+        mbtiles_path,
+        min_zoom=zoom_meta.min_zoom,
+        max_zoom=zoom_meta.max_zoom,
+        image_format=image_format,
+        tile_size=mbtiles_tile_size,
+        deduplicate=not no_dedup,
+    )
 
-        if save_bounds_flag:
-            save_bounds(output_base, bounds)
-
-        if save_ms_flag:
-            save_ms(output_base, metadata_name, min_zoom, max_zoom)
-
-        mbtiles_tile_size = 256
-        mbtiles_metadata = {
-            'name': metadata_name,
-            'format': image_format,
-            'type': 'overlay',
-            'version': '1.0',
-            'description': '@soreixe',
-            'minzoom': str(min_zoom),
-            'maxzoom': str(max_zoom),
-            'bounds': bounds_str,
-            'center': center,
-        }
-
-        mbtiles_path = f"{output_base}.mbtiles"
-        mbtiles_dir = os.path.dirname(mbtiles_path)
-        if mbtiles_dir and not os.path.isdir(mbtiles_dir):
-            os.makedirs(mbtiles_dir, exist_ok=True)
-        print(f"Экспорт MBTiles в {mbtiles_path} ...")
-
-        render_min_zoom = max_zoom if min_zoom < max_zoom else min_zoom
-        export_geowarp_mbtiles(
-            None,
-            bounds,
-            zoom,
-            mbtiles_path,
-            tile_size=mbtiles_tile_size,
-            metadata=mbtiles_metadata,
-            deduplicate=not no_dedup,
-            image_format=image_format,
-            min_zoom=render_min_zoom,
-            max_zoom=max_zoom,
-            projective_source={
-                'src_array': img_np,
-                'matrix_inv': M_inv,
-                'dest_size': dest_size,
-                'border_value': (0, 0, 0, 0),
-            },
-        )
-
-        build_lower_zoom_pyramid(
-            mbtiles_path,
-            min_zoom=min_zoom,
-            max_zoom=max_zoom,
-            image_format=image_format,
-            tile_size=mbtiles_tile_size,
-            deduplicate=not no_dedup,
-        )
-
-        del img_np
-        gc.collect()
-
-    finally:
-        fv.close()
+    projective_ctx = None
+    gc.collect()
 
 
 @click.command()
@@ -887,12 +964,6 @@ def run_conversion(
     default=None,
     type=str,
     help='Путь к входному PGD-файлу. Если не указан, откроется диалог выбора.',
-)
-@click.option(
-    '--out-name',
-    default=None,
-    type=str,
-    help='Базовое имя выходных файлов (без расширения). По умолчанию используется имя PGD-файла.',
 )
 @click.option(
     '--format',
@@ -906,22 +977,36 @@ def run_conversion(
 @click.option('--save-bounds', 'save_bounds_flag', is_flag=True, help='Сохранить bounds в JSON (например, для Leaflet).')
 @click.option('--save-ms', 'save_ms_flag', is_flag=True, help='Создать MapSource (*.ms) для Guru Maps.')
 @click.option(
+    '--ms-opacity',
+    default=None,
+    type=float,
+    help='Значение opacity (0..1) для MapSource. Используется только вместе с --save-ms.',
+)
+@click.option(
     '--zoom-pad',
     default=0,
     show_default=True,
     type=int,
     help='Количество уровней вниз от автоматически вычисленного зума.',
 )
+@click.option(
+    '--max-zoom-pad',
+    default=0,
+    show_default=True,
+    type=int,
+    help='Смещение максимального уровня зума относительно вычисленного.',
+)
 @click.option('--no-dedup', is_flag=True, help='Отключить дедупликацию одинаковых тайлов.')
 
 def main(
     pgd_path: Optional[str],
-    out_name: Optional[str],
     image_format: str,
     save_mosaic: bool,
     save_bounds_flag: bool,
     save_ms_flag: bool,
+    ms_opacity: Optional[float],
     zoom_pad: int,
+    max_zoom_pad: int,
     no_dedup: bool,
 ) -> None:
     """CLI-обёртка для конвертации PGD в MBTiles."""
@@ -941,15 +1026,16 @@ def main(
             print(f"[{idx}/{len(targets)}] {path}")
         run_conversion(
             pgd_path=path,
-            out_name=out_name,
             image_format=image_format,
             save_mosaic=save_mosaic,
             save_bounds_flag=save_bounds_flag,
             save_ms_flag=save_ms_flag,
+            ms_opacity=ms_opacity,
             zoom_pad=zoom_pad,
+            max_zoom_pad=max_zoom_pad,
             no_dedup=no_dedup,
         )
 
 
 if __name__ == '__main__':
-    main()
+    main()  # type: ignore[misc]
